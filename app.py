@@ -1,18 +1,4 @@
 #!/usr/bin/env python3
-"""
-    use: streamlit run ViaMedi/Quiz/app.py
-    to start the quiz app.
-"""
-
-"""
-Streamlit‑Quiz‑App
-
-• Admin lädt Fragen‑Datei → erhält Quiz‑Link (7 Tage gültig)
-• Teilnehmer füllen Quiz aus (keine Punkteanzeige)
-• Ergebnisse werden zentral in results/<quiz_id>_results.csv gesammelt
-• Admin kann Ergebnisse einer Quiz‑ID einsehen & herunterladen
-• QUIZ_DIR und RES_DIR liegen immer im Ordner der app.py
-"""
 
 import os
 import uuid
