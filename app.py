@@ -32,10 +32,11 @@ class Question:
     weight: float = 1.0
 
 def mc_grader(ans: str, corr: Sequence[str]) -> float:
-    if not ans:
+    if not ans:                     # keine Antwort gegeben
         return 0.0
-    u = {a.strip().lower() for a in ans.split("|") if a}
-    c = {c.strip().lower() for c in corr}
+    
+    u = {a.strip().lower() for a in ans.split("|") if a}  # Antworten des Users
+    c = {c.strip().lower() for c in corr}                 # Korrekte Antworten
 
     if u - c:                       # enthält mindestens eine falsche Option
         return 0.0
@@ -61,7 +62,7 @@ def _df_to_questions(df: pd.DataFrame) -> List[Question]:
                 idx = [int(i)-1 for i in corr.split(";") if i]
                 corr_list = [opts[i] for i in idx if 0 <= i < len(opts)]
             else:
-                corr_list = [c.strip() for c in corr.split(";") if c]
+                corr_list = [c.strip() for c in str(row["Richtige Antworten"]).split(";") if c.strip()]
             qs.append(Question(prompt, "mc", corr_list, opts, weight))
         else:
             qs.append(Question(prompt, "open", corr, None, weight))
