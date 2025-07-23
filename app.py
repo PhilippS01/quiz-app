@@ -36,7 +36,11 @@ def mc_grader(ans: str, corr: Sequence[str]) -> float:
         return 0.0
     u = {a.strip().lower() for a in ans.split("|") if a}
     c = {c.strip().lower() for c in corr}
-    return len(u & c) / len(c) if c else 0.0
+
+    if u - c:                       # enthält mindestens eine falsche Option
+        return 0.0
+
+    return len(u) / len(c) if c else 0.0
 
 def open_grader(ans: str, corr: str) -> float:
     return float(ans.strip().lower() == str(corr).strip().lower())
