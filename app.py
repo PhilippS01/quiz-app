@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -10,13 +11,13 @@ import pandas as pd
 import streamlit as st
 
 # ------------------------------------------------------------------
-# Ordner absolut relativ zur Datei app.py  (→ nie mehr extern!)
+# Ordner absolut relativ zur Datei app.py  (-> nie mehr extern!)
 # ------------------------------------------------------------------
 APP_DIR  = os.path.dirname(os.path.abspath(__file__))
 QUIZ_DIR = os.path.join(APP_DIR, "quizzes")
 RES_DIR  = os.path.join(APP_DIR, "results")
 
-# Kompatibilität für alte Streamlit‑Versionen
+# Kompatibilität für alte Streamlit-Versionen
 if not hasattr(st, "experimental_rerun"):
     st.experimental_rerun = st.rerun
 
@@ -109,7 +110,7 @@ def save_result(name: str,
 # ------------------------------------------------------------------
 st.set_page_config("Quiz", "❓", layout="centered")
 
-# Query‑Parameter vereinheitlichen
+# Query-Parameter vereinheitlichen
 try:
     raw = st.query_params
     params = {k: v for k, v in raw.items()}
@@ -118,25 +119,41 @@ except AttributeError:
     params = {k: v[0] if isinstance(v, list) else v for k, v in raw.items()}
 
 # ================================================================
-# QUIZ‑MODUS
+# QUIZ-MODUS
 # ================================================================
 if "quiz_id" in params:
     quiz_id = params["quiz_id"]
     qfile   = os.path.join(QUIZ_DIR, f"{quiz_id}_questions.csv")
+    mfile   = os.path.join(QUIZ_DIR, f"{quiz_id}_meta.json")
 
     if not os.path.exists(qfile):
-        st.error("Quiz nicht gefunden – Link korrekt?")
+        st.error("Quiz nicht gefunden - Link korrekt?")
         st.stop()
 
-    # 7‑Tage‑Limit
-    if datetime.now() - datetime.fromtimestamp(os.path.getmtime(qfile)) > timedelta(days=7):
-        st.error("Dieser Quiz‑Link ist abgelaufen (älter als 7 Tage).")
+    if not os.path.exists(mfile):
+        st.error("Quiz-Metadaten nicht gefunden.")
+        st.stop()
+
+    with open(mfile, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    expires_at = datetime.fromisoformat(meta["expires_at"])
+    if datetime.now() > expires_at:
+        try:
+            if os.path.exists(qfile):
+                os.remove(qfile)
+            if os.path.exists(mfile):
+                os.remove(mfile)
+        except Exception:
+            pass
+
+        st.error("Dieser Quiz-Link ist abgelaufen.")
         st.stop()
 
     with open(qfile, "rb") as f:
         questions = load_questions(f)
 
-    st.title("📋 Online‑Quiz")
+    st.title("📋 Online-Quiz")
     name = st.text_input("Dein Name")
     if name:
         st.divider()
@@ -163,28 +180,31 @@ if "quiz_id" in params:
                 st.experimental_rerun()
 
 # ================================================================
-# ADMIN‑MODUS
+# ADMIN-MODUS
 # ================================================================
 else:
-    st.title("📋 Quiz‑Administration")
+    st.title("📋 Quiz-Administration")
     st.header("Quiz einrichten")
 
-    up_file = st.file_uploader("Fragen‑Datei (CSV / Excel)",
+    up_file = st.file_uploader("Fragen-Datei (CSV / Excel)",
                                type=["csv", "xls", "xlsx"])
 
-    if st.button("Quiz‑Link erstellen"):
+    if st.button("Quiz-Link erstellen"):
         if not up_file:
             st.error("Bitte erst eine Datei wählen.")
             st.stop()
+
         try:
-            _ = load_questions(up_file)           # Validierung
+            _ = load_questions(up_file)   # Validierung
         except Exception as e:
             st.error(f"Dateifehler: {e}")
             st.stop()
 
         quiz_id = str(uuid.uuid4())[:8]
         os.makedirs(QUIZ_DIR, exist_ok=True)
+
         qcsv = os.path.join(QUIZ_DIR, f"{quiz_id}_questions.csv")
+        mfile = os.path.join(QUIZ_DIR, f"{quiz_id}_meta.json")
 
         up_file.seek(0)
         if up_file.name.lower().endswith((".xls", ".xlsx")):
@@ -193,14 +213,26 @@ else:
             with open(qcsv, "wb") as f:
                 f.write(up_file.read())
 
+        created_at = datetime.now()
+        expires_at = created_at + timedelta(days=7)
+
+        meta = {
+            "quiz_id": quiz_id,
+            "created_at": created_at.isoformat(),
+            "expires_at": expires_at.isoformat()
+        }
+
+        with open(mfile, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
         st.success("Quiz erfolgreich angelegt! Link zum Teilen:")
         st.markdown(f"[➡️ Zum Quiz starten](/?quiz_id={quiz_id})")
-        st.info("Link ist 7 Tage gültig.")
+        st.info(f"Link ist gültig bis: {expires_at.strftime('%d.%m.%Y %H:%M')}")
         st.code(quiz_id)
 
     # ----------------- Ergebnisse einsehen -----------------
-    st.header("Quiz‑Ergebnisse ansehen")
-    quiz_to_check = st.text_input("Quiz‑ID eingeben, um Ergebnisse zu laden:")
+    st.header("Quiz-Ergebnisse ansehen")
+    quiz_to_check = st.text_input("Quiz-ID eingeben, um Ergebnisse zu laden:")
     if st.button("Ergebnisse laden") and quiz_to_check:
         res_file = os.path.join(RES_DIR, f"{quiz_to_check}_results.csv")
         if os.path.exists(res_file):
@@ -211,4 +243,4 @@ else:
                                df.to_csv(index=False).encode("utf-8"),
                                file_name=f"Quiz_{quiz_to_check}_Ergebnisse.csv")
         else:
-            st.error("Keine Ergebnisse für diese Quiz‑ID gefunden.")
+            st.error("Keine Ergebnisse für diese Quiz-ID gefunden.")
