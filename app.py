@@ -1,246 +1,341 @@
 #!/usr/bin/env python3
 
-import os
+import hashlib
+import hmac
+import io
 import json
 import uuid
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Sequence
 
 import pandas as pd
 import streamlit as st
+from supabase import Client, create_client
 
-# ------------------------------------------------------------------
-# Ordner absolut relativ zur Datei app.py  (-> nie mehr extern!)
-# ------------------------------------------------------------------
-APP_DIR  = os.path.dirname(os.path.abspath(__file__))
-QUIZ_DIR = os.path.join(APP_DIR, "quizzes")
-RES_DIR  = os.path.join(APP_DIR, "results")
 
-# Kompatibilität für alte Streamlit-Versionen
-if not hasattr(st, "experimental_rerun"):
-    st.experimental_rerun = st.rerun
+QUIZ_VALID_DAYS = 7
 
-# ------------------------------------------------------------------
-# Datenmodell & Bewertung
-# ------------------------------------------------------------------
+
 @dataclass
 class Question:
     prompt: str
-    qtype: str          # "mc" | "open"
+    qtype: str  # "mc" | "open"
     correct: Sequence[str] | str
     options: Optional[Sequence[str]] = None
     weight: float = 1.0
 
-def mc_grader(ans: str, corr: Sequence[str]) -> float:
-    if not ans:                     # keine Antwort gegeben
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def parse_timestamp(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def mc_grader(answer: str, correct: Sequence[str]) -> float:
+    if not answer:
         return 0.0
-    
-    u = {a.strip().lower() for a in ans.split("|") if a}  # Antworten des Users
-    c = {c.strip().lower() for c in corr}                 # Korrekte Antworten
 
-    if u - c:                       # enthält mindestens eine falsche Option
+    selected = {item.strip().casefold() for item in answer.split("|") if item.strip()}
+    expected = {str(item).strip().casefold() for item in correct if str(item).strip()}
+
+    if not expected or selected - expected:
         return 0.0
+    return len(selected) / len(expected)
 
-    return len(u) / len(c) if c else 0.0
 
-def open_grader(ans: str, corr: str) -> float:
-    return float(ans.strip().lower() == str(corr).strip().lower())
+def open_grader(answer: str, correct: str) -> float:
+    return float(answer.strip().casefold() == str(correct).strip().casefold())
 
-# ------------------------------------------------------------------
-# Fragen laden
-# ------------------------------------------------------------------
+
 def _df_to_questions(df: pd.DataFrame) -> List[Question]:
-    qs: List[Question] = []
-    for _, row in df.iterrows():
-        qtype  = str(row["Typ"]).strip().lower()
+    questions: List[Question] = []
+
+    for row_number, (_, row) in enumerate(df.iterrows(), start=2):
+        qtype = str(row["Typ"]).strip().lower()
         prompt = str(row["Frage"]).strip()
-        weight = float(row.get("Gewicht", 1.0))
-        corr   = str(row["Richtige Antworten"]).strip()
+        correct_raw = str(row["Richtige Antworten"]).strip()
+
+        if not prompt:
+            raise ValueError(f"Zeile {row_number}: Die Frage ist leer.")
+        if qtype not in {"mc", "open"}:
+            raise ValueError(f"Zeile {row_number}: Typ muss 'mc' oder 'open' sein.")
+
+        weight_raw = row.get("Gewicht", 1.0)
+        weight = 1.0 if pd.isna(weight_raw) else float(weight_raw)
+        if weight <= 0:
+            raise ValueError(f"Zeile {row_number}: Gewicht muss größer als 0 sein.")
+
         if qtype == "mc":
-            opts = [o.strip() for o in str(row["Antwortmöglichkeiten"]).split(";") if o.strip()]
-            corr_list = [c.strip() for c in corr.split(";") if c.strip()]
-            qs.append(Question(prompt, "mc", corr_list, opts, weight))
+            options_raw = row.get("Antwortmöglichkeiten", "")
+            options = [item.strip() for item in str(options_raw).split(";") if item.strip()]
+            correct = [item.strip() for item in correct_raw.split(";") if item.strip()]
+
+            if len(options) < 2:
+                raise ValueError(f"Zeile {row_number}: MC-Frage benötigt mindestens zwei Optionen.")
+            if not correct:
+                raise ValueError(f"Zeile {row_number}: Mindestens eine richtige Antwort fehlt.")
+
+            option_lookup = {item.casefold() for item in options}
+            invalid = [item for item in correct if item.casefold() not in option_lookup]
+            if invalid:
+                raise ValueError(
+                    f"Zeile {row_number}: Richtige Antworten müssen als Antworttext angegeben werden. "
+                    f"Nicht in den Optionen gefunden: {', '.join(invalid)}"
+                )
+
+            questions.append(Question(prompt, "mc", correct, options, weight))
         else:
-            qs.append(Question(prompt, "open", corr, None, weight))
-    return qs
+            if not correct_raw:
+                raise ValueError(f"Zeile {row_number}: Richtige Antwort fehlt.")
+            questions.append(Question(prompt, "open", correct_raw, None, weight))
 
-@st.cache_data(show_spinner=False)
-def load_questions(file) -> List[Question]:
-    ext = os.path.splitext(file.name)[1].lower()
-    if ext in {".xls", ".xlsx"}:
-        df = pd.read_excel(file)
-    else:                         # CSV
-        file.seek(0)
-        df = pd.read_csv(file, sep=",", engine="python")
-        if len(df.columns) == 1:  # evtl. Semikolon
-            file.seek(0)
-            df = pd.read_csv(file, sep=";", engine="python")
-    df.columns = [c.strip() for c in df.columns]
+    if not questions:
+        raise ValueError("Die Datei enthält keine Fragen.")
+    return questions
 
+
+def load_questions(uploaded_file) -> List[Question]:
+    uploaded_file.seek(0)
+    raw = uploaded_file.read()
+    name = uploaded_file.name.lower()
+
+    if name.endswith((".xls", ".xlsx")):
+        df = pd.read_excel(io.BytesIO(raw))
+    else:
+        try:
+            df = pd.read_csv(io.BytesIO(raw), sep=",", engine="python")
+            if len(df.columns) == 1:
+                df = pd.read_csv(io.BytesIO(raw), sep=";", engine="python")
+        except UnicodeDecodeError:
+            df = pd.read_csv(io.BytesIO(raw), sep=";", encoding="latin-1", engine="python")
+
+    df.columns = [str(column).strip() for column in df.columns]
     required = {"Frage", "Typ", "Antwortmöglichkeiten", "Richtige Antworten"}
-    if not required.issubset(df.columns):
-        missing = ", ".join(c for c in required if c not in df.columns)
-        raise ValueError(f"Fehlende Spalten: {missing}")
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Fehlende Spalten: {', '.join(sorted(missing))}")
 
     return _df_to_questions(df)
 
-# ------------------------------------------------------------------
-# Ergebnis anhängen
-# ------------------------------------------------------------------
-def save_result(name: str,
-                answers: Dict[str, str],
-                scores: Dict[str, float],
-                questions: List[Question],
-                quiz_id: str) -> None:
-    row = {"Name": name,
-           "Zeit": datetime.now().isoformat(timespec="seconds"),
-           "Total": sum(scores.values())}
-    for i, q in enumerate(questions, 1):
-        row[f"F{i} Antwort"] = answers.get(q.prompt, "")
-        row[f"F{i} Punkte"]  = round(scores.get(q.prompt, 0), 2)
 
-    os.makedirs(RES_DIR, exist_ok=True)
-    path = os.path.join(RES_DIR, f"{quiz_id}_results.csv")
-    pd.DataFrame([row]).to_csv(path, mode="a", index=False,
-                               header=not os.path.exists(path))
+@st.cache_resource
+def get_database() -> Client:
+    try:
+        url = st.secrets["supabase"]["url"]
+        key = st.secrets["supabase"]["service_role_key"]
+    except (FileNotFoundError, KeyError) as exc:
+        raise RuntimeError(
+            "Supabase-Zugangsdaten fehlen. Lege in den Streamlit-Secrets "
+            "[supabase] url und service_role_key an."
+        ) from exc
+    return create_client(url, key)
 
-# ------------------------------------------------------------------
-# Streamlit Config
-# ------------------------------------------------------------------
-st.set_page_config("Quiz", "❓", layout="centered")
 
-# Query-Parameter vereinheitlichen
+def get_quiz(db: Client, quiz_id: str) -> Optional[dict]:
+    response = db.table("quizzes").select("*").eq("quiz_id", quiz_id).limit(1).execute()
+    return response.data[0] if response.data else None
+
+
+def save_result(
+    db: Client,
+    name: str,
+    answers: Dict[str, str],
+    scores: Dict[str, float],
+    questions: List[Question],
+    quiz_id: str,
+) -> None:
+    answers_by_number = {
+        f"F{i}": answers.get(question.prompt, "")
+        for i, question in enumerate(questions, start=1)
+    }
+    scores_by_number = {
+        f"F{i}": round(float(scores.get(question.prompt, 0.0)), 2)
+        for i, question in enumerate(questions, start=1)
+    }
+
+    db.table("quiz_results").insert(
+        {
+            "quiz_id": quiz_id,
+            "participant_name": name.strip(),
+            "submitted_at": utc_now().isoformat(),
+            "total": round(float(sum(scores.values())), 2),
+            "answers": answers_by_number,
+            "scores": scores_by_number,
+        }
+    ).execute()
+
+
+def admin_password_is_valid(password: str) -> bool:
+    try:
+        expected_hash = st.secrets["admin"]["password_sha256"]
+    except (FileNotFoundError, KeyError):
+        return False
+    actual_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    return hmac.compare_digest(actual_hash, expected_hash)
+
+
+def results_to_dataframe(rows: List[dict]) -> pd.DataFrame:
+    flattened: List[dict] = []
+    for row in rows:
+        item = {
+            "Name": row.get("participant_name", ""),
+            "Zeit": row.get("submitted_at", ""),
+            "Total": row.get("total", 0),
+        }
+        answers = row.get("answers") or {}
+        scores = row.get("scores") or {}
+        for key in sorted(answers, key=lambda value: int(value[1:])):
+            item[f"{key} Antwort"] = answers[key]
+            item[f"{key} Punkte"] = scores.get(key, 0)
+        flattened.append(item)
+    return pd.DataFrame(flattened)
+
+
+st.set_page_config(page_title="Quiz", page_icon="❓", layout="centered")
+
 try:
-    raw = st.query_params
-    params = {k: v for k, v in raw.items()}
+    db = get_database()
+except RuntimeError as error:
+    st.error(str(error))
+    st.stop()
+
+try:
+    params = dict(st.query_params)
 except AttributeError:
-    raw = st.experimental_get_query_params()
-    params = {k: v[0] if isinstance(v, list) else v for k, v in raw.items()}
+    raw_params = st.experimental_get_query_params()
+    params = {key: value[0] if isinstance(value, list) else value for key, value in raw_params.items()}
 
-# ================================================================
-# QUIZ-MODUS
-# ================================================================
+
 if "quiz_id" in params:
-    quiz_id = params["quiz_id"]
-    qfile   = os.path.join(QUIZ_DIR, f"{quiz_id}_questions.csv")
-    mfile   = os.path.join(QUIZ_DIR, f"{quiz_id}_meta.json")
+    quiz_id = str(params["quiz_id"]).strip()
+    quiz = get_quiz(db, quiz_id)
 
-    if not os.path.exists(qfile):
-        st.error("Quiz nicht gefunden - Link korrekt?")
+    if not quiz:
+        st.error("Quiz nicht gefunden – ist der Link korrekt?")
         st.stop()
 
-    if not os.path.exists(mfile):
-        st.error("Quiz-Metadaten nicht gefunden.")
-        st.stop()
-
-    with open(mfile, "r", encoding="utf-8") as f:
-        meta = json.load(f)
-
-    expires_at = datetime.fromisoformat(meta["expires_at"])
-    if datetime.now() > expires_at:
-        try:
-            if os.path.exists(qfile):
-                os.remove(qfile)
-            if os.path.exists(mfile):
-                os.remove(mfile)
-        except Exception:
-            pass
-
+    if utc_now() > parse_timestamp(quiz["expires_at"]):
         st.error("Dieser Quiz-Link ist abgelaufen.")
         st.stop()
 
-    with open(qfile, "rb") as f:
-        questions = load_questions(f)
+    questions = [Question(**question) for question in quiz["questions"]]
 
     st.title("📋 Online-Quiz")
-    name = st.text_input("Dein Name")
+    name = st.text_input("Dein Name", key="participant_name").strip()
+
     if name:
         st.divider()
         answers: Dict[str, str] = {}
-        for i, q in enumerate(questions, 1):
-            if q.qtype == "mc":
-                sel = st.multiselect(f"{i}. {q.prompt}", q.options, key=f"q{i}")
-                answers[q.prompt] = "|".join(sel)
+        for index, question in enumerate(questions, start=1):
+            if question.qtype == "mc":
+                selected = st.multiselect(
+                    f"{index}. {question.prompt}",
+                    question.options,
+                    key=f"q{index}",
+                )
+                answers[question.prompt] = "|".join(selected)
             else:
-                answers[q.prompt] = st.text_input(f"{i}. {q.prompt}", key=f"q{i}")
+                answers[question.prompt] = st.text_input(
+                    f"{index}. {question.prompt}",
+                    key=f"q{index}",
+                )
 
-        if st.button("Antworten absenden", type="primary"):
-            scores = {q.prompt: (q.weight * mc_grader(answers[q.prompt], q.correct)
-                                 if q.qtype == "mc"
-                                 else q.weight * open_grader(answers[q.prompt], q.correct))
-                      for q in questions}
-            save_result(name, answers, scores, questions, quiz_id)
-            st.success("Danke, deine Antworten wurden eingereicht!")
-            st.balloons()
-            if st.button("Nächste Person"):
-                for k in list(st.session_state.keys()):
-                    if k.startswith("q") or k == "Name":
-                        del st.session_state[k]
-                st.experimental_rerun()
+        if st.button("Antworten absenden", type="primary", disabled=st.session_state.get("submitted", False)):
+            scores = {
+                question.prompt: (
+                    question.weight * mc_grader(answers[question.prompt], question.correct)
+                    if question.qtype == "mc"
+                    else question.weight * open_grader(answers[question.prompt], question.correct)
+                )
+                for question in questions
+            }
+            try:
+                save_result(db, name, answers, scores, questions, quiz_id)
+            except Exception as error:
+                st.error(f"Das Ergebnis konnte nicht gespeichert werden: {error}")
+            else:
+                st.session_state["submitted"] = True
+                st.success("Danke, deine Antworten wurden gespeichert!")
+                st.balloons()
 
-# ================================================================
-# ADMIN-MODUS
-# ================================================================
+        if st.session_state.get("submitted") and st.button("Nächste Person"):
+            for key in list(st.session_state):
+                if key.startswith("q") or key in {"participant_name", "submitted"}:
+                    del st.session_state[key]
+            st.rerun()
+
 else:
     st.title("📋 Quiz-Administration")
-    st.header("Quiz einrichten")
 
-    up_file = st.file_uploader("Fragen-Datei (CSV / Excel)",
-                               type=["csv", "xls", "xlsx"])
+    with st.expander("Neues Quiz erstellen", expanded=True):
+        uploaded_file = st.file_uploader(
+            "Fragen-Datei (CSV / Excel)",
+            type=["csv", "xls", "xlsx"],
+        )
 
-    if st.button("Quiz-Link erstellen"):
-        if not up_file:
-            st.error("Bitte erst eine Datei wählen.")
-            st.stop()
+        if st.button("Quiz-Link erstellen", type="primary"):
+            if not uploaded_file:
+                st.error("Bitte zuerst eine Datei auswählen.")
+                st.stop()
 
-        try:
-            _ = load_questions(up_file)   # Validierung
-        except Exception as e:
-            st.error(f"Dateifehler: {e}")
-            st.stop()
+            try:
+                questions = load_questions(uploaded_file)
+                quiz_id = uuid.uuid4().hex[:12]
+                created_at = utc_now()
+                expires_at = created_at + timedelta(days=QUIZ_VALID_DAYS)
 
-        quiz_id = str(uuid.uuid4())[:8]
-        os.makedirs(QUIZ_DIR, exist_ok=True)
+                db.table("quizzes").insert(
+                    {
+                        "quiz_id": quiz_id,
+                        "created_at": created_at.isoformat(),
+                        "expires_at": expires_at.isoformat(),
+                        "questions": [asdict(question) for question in questions],
+                    }
+                ).execute()
+            except Exception as error:
+                st.error(f"Quiz konnte nicht erstellt werden: {error}")
+            else:
+                query = f"?quiz_id={quiz_id}"
+                st.success("Quiz erfolgreich angelegt.")
+                st.link_button("➡️ Zum Quiz", query)
+                st.code(query)
+                st.info(f"Gültig bis: {expires_at.astimezone().strftime('%d.%m.%Y %H:%M %Z')}")
 
-        qcsv = os.path.join(QUIZ_DIR, f"{quiz_id}_questions.csv")
-        mfile = os.path.join(QUIZ_DIR, f"{quiz_id}_meta.json")
+    st.header("Quiz-Ergebnisse")
+    admin_password = st.text_input("Admin-Passwort", type="password")
+    quiz_to_check = st.text_input("Quiz-ID")
 
-        up_file.seek(0)
-        if up_file.name.lower().endswith((".xls", ".xlsx")):
-            pd.read_excel(up_file).to_csv(qcsv, index=False)
+    if st.button("Ergebnisse laden"):
+        if not admin_password_is_valid(admin_password):
+            st.error("Admin-Passwort ist falsch oder noch nicht eingerichtet.")
+        elif not quiz_to_check.strip():
+            st.error("Bitte eine Quiz-ID eingeben.")
         else:
-            with open(qcsv, "wb") as f:
-                f.write(up_file.read())
-
-        created_at = datetime.now()
-        expires_at = created_at + timedelta(days=7)
-
-        meta = {
-            "quiz_id": quiz_id,
-            "created_at": created_at.isoformat(),
-            "expires_at": expires_at.isoformat()
-        }
-
-        with open(mfile, "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=False, indent=2)
-
-        st.success("Quiz erfolgreich angelegt! Link zum Teilen:")
-        st.markdown(f"[➡️ Zum Quiz starten](/?quiz_id={quiz_id})")
-        st.info(f"Link ist gültig bis: {expires_at.strftime('%d.%m.%Y %H:%M')}")
-        st.code(quiz_id)
-
-    # ----------------- Ergebnisse einsehen -----------------
-    st.header("Quiz-Ergebnisse ansehen")
-    quiz_to_check = st.text_input("Quiz-ID eingeben, um Ergebnisse zu laden:")
-    if st.button("Ergebnisse laden") and quiz_to_check:
-        res_file = os.path.join(RES_DIR, f"{quiz_to_check}_results.csv")
-        if os.path.exists(res_file):
-            df = pd.read_csv(res_file)
-            st.write(f"Ergebnisse für Quiz {quiz_to_check}:")
-            st.dataframe(df)
-            st.download_button("CSV herunterladen",
-                               df.to_csv(index=False).encode("utf-8"),
-                               file_name=f"Quiz_{quiz_to_check}_Ergebnisse.csv")
-        else:
-            st.error("Keine Ergebnisse für diese Quiz-ID gefunden.")
+            try:
+                response = (
+                    db.table("quiz_results")
+                    .select("participant_name,submitted_at,total,answers,scores")
+                    .eq("quiz_id", quiz_to_check.strip())
+                    .order("submitted_at")
+                    .execute()
+                )
+            except Exception as error:
+                st.error(f"Ergebnisse konnten nicht geladen werden: {error}")
+            else:
+                if not response.data:
+                    st.warning("Für diese Quiz-ID gibt es noch keine Ergebnisse.")
+                else:
+                    result_df = results_to_dataframe(response.data)
+                    st.dataframe(result_df, use_container_width=True)
+                    st.download_button(
+                        "CSV herunterladen",
+                        result_df.to_csv(index=False).encode("utf-8-sig"),
+                        file_name=f"Quiz_{quiz_to_check.strip()}_Ergebnisse.csv",
+                        mime="text/csv",
+                    )

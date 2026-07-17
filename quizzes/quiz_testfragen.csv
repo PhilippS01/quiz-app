@@ -1,6 +1,6 @@
 Frage;Typ;Antwortmöglichkeiten;Richtige Antworten;Gewicht
 Was ist die Hauptstadt von Deutschland?;open;;Berlin;1.0
-Welche Farben sind NICHT rot in der deutschen Flagge?;mc;"Schwarz; Rot; Gold";"1;3";1.0
+Welche Farben sind NICHT rot in der deutschen Flagge?;mc;"Schwarz; Rot; Gold";"Schwarz;Gold";1.0
 Was ergibt 4 + 4?;open;;8;0.5
-Welche Zahl ist größer als 3?;mc;"2; 4; 5";"1;3";1.5
+Welche Zahl ist größer als 3?;mc;"2; 4; 5";"4;5";1.5
 Was ist das chemische Symbol für Wasser?;open;;H2O;1.0
